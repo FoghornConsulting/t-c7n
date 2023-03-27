@@ -12,5 +12,5 @@ sendgrid==5.6.0
 # pinned to 3.1.0 due to an issue with 3.2 and fakeredis, as
 # 3.2 performs socket verification.
 # https://github.com/jamesls/fakeredis/issues/235
-redis==3.1.0
+redis==4.5.3
 ldap3==2.5.2
