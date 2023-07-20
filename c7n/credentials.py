@@ -1,21 +1,8 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 """
 Authentication utilities
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import os
 
 from botocore.credentials import RefreshableCredentials
@@ -26,22 +13,28 @@ from c7n.version import version
 from c7n.utils import get_retry
 
 
-class SessionFactory(object):
+# we still have some issues (see #5023) to work through to switch to
+# default regional endpoints, for now its opt-in.
+USE_STS_REGIONAL = os.environ.get(
+    'C7N_USE_STS_REGIONAL', '').lower() in ('yes', 'true')
+
+
+class SessionFactory:
 
     def __init__(self, region, profile=None, assume_role=None, external_id=None):
         self.region = region
         self.profile = profile
         self.assume_role = assume_role
         self.external_id = external_id
-        self.user_agent_name = "CloudCustodian"
         self.session_name = "CloudCustodian"
         if 'C7N_SESSION_SUFFIX' in os.environ:
             self.session_name = "%s@%s" % (
                 self.session_name, os.environ['C7N_SESSION_SUFFIX'])
         self._subscribers = []
+        self._policy_name = ""
 
     def _set_policy_name(self, name):
-        self.user_agent_name = ("CloudCustodian(%s)" % name).strip()
+        self._policy_name = name
 
     policy_name = property(None, _set_policy_name)
 
@@ -58,8 +51,10 @@ class SessionFactory(object):
         return self.update(session)
 
     def update(self, session):
-        session._session.user_agent_name = self.user_agent_name
+        session._session.user_agent_name = "c7n"
         session._session.user_agent_version = version
+        if self._policy_name:
+            session._session.user_agent_extra = f"c7n/policy#{self._policy_name}"
 
         for s in self._subscribers:
             s(session)
@@ -98,7 +93,8 @@ def assumed_session(role_arn, session_name, session=None, region=None, external_
             parameters['ExternalId'] = external_id
 
         credentials = retry(
-            session.client('sts').assume_role, **parameters)['Credentials']
+            get_sts_client(
+                session, region).assume_role, **parameters)['Credentials']
         return dict(
             access_key=credentials['AccessKeyId'],
             secret_key=credentials['SecretAccessKey'],
@@ -123,3 +119,20 @@ def assumed_session(role_arn, session_name, session=None, region=None, external_
         region = s.get_config_variable('region') or 'us-east-1'
     s.set_config_variable('region', region)
     return Session(botocore_session=s)
+
+
+def get_sts_client(session, region):
+    """Get the AWS STS endpoint specific for the given region.
+
+    Returns the global endpoint if region is not specified.
+
+    For the list of regional endpoints, see https://amzn.to/2ohJgtR
+    """
+    if region and USE_STS_REGIONAL:
+        endpoint_url = "https://sts.{}.amazonaws.com".format(region)
+        region_name = region
+    else:
+        endpoint_url = None
+        region_name = None
+    return session.client(
+        'sts', endpoint_url=endpoint_url, region_name=region_name)

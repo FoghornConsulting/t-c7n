@@ -1,16 +1,5 @@
-# Copyright 2017-2018 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 
 
 import base64
@@ -20,7 +9,9 @@ import zlib
 from .core import EventAction
 from c7n import utils
 from c7n.exceptions import PolicyValidationError
+from c7n.manager import resources as aws_resources
 from c7n.resolver import ValuesFrom
+from c7n.version import version
 
 
 class BaseNotify(EventAction):
@@ -66,50 +57,51 @@ class Notify(BaseNotify):
     transport, with the exception of the ``mtype`` attribute, which is a
     reserved attribute used by Cloud Custodian.
 
-    Example::
+    :example:
 
-      policies:
-        - name: ec2-bad-instance-kill
-          resource: ec2
-          filters:
-           - Name: bad-instance
-          actions:
-           - terminate
-           - type: notify
-             to:
-              - event-user
-              - resource-creator
-              - email@address
-             owner_absent_contact:
-              - other_email@address
-             # which template for the email should we use
-             template: policy-template
-             transport:
-               type: sqs
-               region: us-east-1
-               queue: xyz
+    .. code-block:: yaml
 
-        - name: ec2-notify-with-attributes
-          resource: ec2
-          filters:
-           - Name: bad-instance
-          actions:
-           - type: notify
-             to:
-              - event-user
-              - resource-creator
-              - email@address
-             owner_absent_contact:
-              - other_email@address
-             # which template for the email should we use
-             template: policy-template
-             transport:
-               type: sns
-               region: us-east-1
-               topic: your-notify-topic
-               attributes:
-                 - attribute_key: attribute_value
-                 - attribute_key_2: attribute_value_2
+              policies:
+                - name: ec2-bad-instance-kill
+                  resource: ec2
+                  filters:
+                   - Name: bad-instance
+                  actions:
+                   - terminate
+                   - type: notify
+                     to:
+                      - event-user
+                      - resource-creator
+                      - email@address
+                     owner_absent_contact:
+                      - other_email@address
+                     # which template for the email should we use
+                     template: policy-template
+                     transport:
+                       type: sqs
+                       region: us-east-1
+                       queue: xyz
+                - name: ec2-notify-with-attributes
+                  resource: ec2
+                  filters:
+                   - Name: bad-instance
+                  actions:
+                   - type: notify
+                     to:
+                      - event-user
+                      - resource-creator
+                      - email@address
+                     owner_absent_contact:
+                      - other_email@address
+                     # which template for the email should we use
+                     template: policy-template
+                     transport:
+                       type: sns
+                       region: us-east-1
+                       topic: your-notify-topic
+                       attributes:
+                          attribute_key: attribute_value
+                          attribute_key_2: attribute_value_2
     """
 
     C7N_DATA_MESSAGE = "maidmsg/1.0"
@@ -172,11 +164,16 @@ class Notify(BaseNotify):
     def process(self, resources, event=None):
         alias = utils.get_account_alias_from_sts(
             utils.local_session(self.manager.session_factory))
+        partition = utils.get_partition(self.manager.config.region)
         message = {
             'event': event,
             'account_id': self.manager.config.account_id,
+            'partition': partition,
             'account': alias,
+            'version': version,
             'region': self.manager.config.region,
+            'execution_id': self.manager.ctx.execution_id,
+            'execution_start': self.manager.ctx.start_time,
             'policy': self.manager.data}
         message['action'] = self.expand_variables(message)
 
@@ -223,6 +220,14 @@ class Notify(BaseNotify):
                 r.pop('c7n:user-data')
         return resources
 
+    def prepare_iam_saml_provider(self, resources):
+        for r in resources:
+            if 'SAMLMetadataDocument' in r:
+                r.pop('SAMLMetadataDocument')
+            if 'IDPSSODescriptor' in r:
+                r.pop('IDPSSODescriptor')
+        return resources
+
     def send_data_message(self, message):
         if self.data['transport']['type'] == 'sqs':
             return self.send_sqs(message)
@@ -253,11 +258,12 @@ class Notify(BaseNotify):
             for k, v in user_attributes.items():
                 if k != 'mtype':
                     attrs[k] = {'DataType': 'String', 'StringValue': v}
-        client.publish(
+        result = client.publish(
             TopicArn=topic_arn,
             Message=self.pack(message),
             MessageAttributes=attrs
         )
+        return result['MessageId']
 
     def send_sqs(self, message):
         queue = self.data['transport']['queue'].format(**message)
@@ -296,3 +302,13 @@ class Notify(BaseNotify):
             MessageBody=self.pack(message),
             MessageAttributes=attrs)
         return result['MessageId']
+
+    @classmethod
+    def register_resource(cls, registry, resource_class):
+        if 'notify' in resource_class.action_registry:
+            return
+
+        resource_class.action_registry.register('notify', cls)
+
+
+aws_resources.subscribe(Notify.register_resource)

@@ -1,6 +1,10 @@
 *.pyc
 *.egg-info/
 *.swp
+.eggs/
+.terraform
+.terraform.lock.hcl
+# c7n/version.py
 src/
 deps/
 include/
@@ -32,5 +36,22 @@ results.xml
 .vscode/
 !.vscode/*.sample
 .pytest_cache/
+pip-wheel-metadata/
 pyvenv.cfg
 junit
+/.vs
+# these files get copied/generated during doc builds
+docs/source/overview\.rst
+docs/source/tools/*\.md
+docs/source/*/resources
+docs/source/tools/assets/
+.tfcache
+.env
+.venv
+.python-version
+# files generated during "make test"
+label-pod
+test-admission
+test-admission-2
+test-admission-pod
+tests/data/vcr_cassettes/test_output/default_bucket_region_public.yaml

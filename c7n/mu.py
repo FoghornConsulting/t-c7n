@@ -1,23 +1,10 @@
-# Copyright 2015-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 """
 Cloud Custodian Lambda Provisioning Support
 
 docs/lambda.rst
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import abc
 import base64
 import hashlib
@@ -26,23 +13,39 @@ import io
 import json
 import logging
 import os
+import shutil
 import time
 import tempfile
 import zipfile
+import platform
 
-from concurrent.futures import ThreadPoolExecutor
+
+# We use this for freezing dependencies for serverless environments
+# that support service side building.
+# Its also used for release engineering on our pypi uploads
+try:
+    from importlib import metadata as pkgmd
+except ImportError:
+    try:
+        import importlib_metadata as pkgmd
+    except (ImportError, FileNotFoundError):
+        pkgmd = None
+
 
 # Static event mapping to help simplify cwe rules creation
 from c7n.exceptions import ClientError
 from c7n.cwe import CloudWatchEvents
-from c7n.logs_support import _timestamp_from_string
-from c7n.utils import parse_s3, local_session
-
+from c7n.utils import parse_s3, local_session, get_retry, merge_dict
 
 log = logging.getLogger('custodian.serverless')
 
+LambdaRetry = get_retry(('InsufficientPermissionsException',
+                         'InvalidParameterValueException',), max_attempts=5)
+LambdaConflictRetry = get_retry(('ResourceConflictException',), max_attempts=3)
+RuleRetry = get_retry(('ResourceNotFoundException',), max_attempts=2)
 
-class PythonPackageArchive(object):
+
+class PythonPackageArchive:
     """Creates a zip file for python lambda functions.
 
     :param tuple modules: the Python modules to add to the archive
@@ -63,13 +66,31 @@ class PythonPackageArchive(object):
 
     zip_compression = zipfile.ZIP_DEFLATED
 
-    def __init__(self, *modules):
-        self._temp_archive_file = tempfile.NamedTemporaryFile()
+    def __init__(self, modules=(), cache_file=None):
+        self._temp_archive_file = tempfile.NamedTemporaryFile(delete=False)
+        if cache_file:
+            with open(cache_file, 'rb') as fin:
+                shutil.copyfileobj(fin, self._temp_archive_file)
+
         self._zip_file = zipfile.ZipFile(
-            self._temp_archive_file, mode='w',
+            self._temp_archive_file, mode='a',
             compression=self.zip_compression)
         self._closed = False
-        self.add_modules(None, *modules)
+        self.add_modules(None, modules)
+
+    def __del__(self):
+        try:
+            if not self._closed:
+                self.close()
+            if self._temp_archive_file:
+                self._temp_archive_file.close()
+                os.unlink(self.path)
+        except AttributeError:
+            # Finalizers in python are fairly problematic, especially when
+            # breaking cycle references, there are no ordering guaranteees
+            # so our tempfile may already be gc'd before this ref'd version
+            # is called.
+            pass
 
     @property
     def path(self):
@@ -81,7 +102,18 @@ class PythonPackageArchive(object):
             raise ValueError("Archive not closed, size not accurate")
         return os.stat(self._temp_archive_file.name).st_size
 
-    def add_modules(self, ignore, *modules):
+    def create_zinfo(self, file):
+        if not isinstance(file, zipfile.ZipInfo):
+            file = zinfo(file)
+
+        # Ensure we apply the compression
+        file.compress_type = self.zip_compression
+        # Mark host OS as Linux for all archives
+        file.create_system = 3
+
+        return file
+
+    def add_modules(self, ignore, modules):
         """Add the named Python modules to the archive. For consistency's sake
         we only add ``*.py`` files, not ``*.pyc``. We also don't add other
         files, including compiled modules. You'll have to add such files
@@ -99,7 +131,7 @@ class PythonPackageArchive(object):
                     # Likely a namespace package. Try to add *.pth files so
                     # submodules are importable under Python 2.7.
 
-                    sitedir = list(module.__path__)[0].rsplit('/', 1)[0]
+                    sitedir = os.path.abspath(os.path.join(list(module.__path__)[0], os.pardir))
                     for filename in os.listdir(sitedir):
                         s = filename.startswith
                         e = filename.endswith
@@ -183,10 +215,7 @@ class PythonPackageArchive(object):
 
         """
         assert not self._closed, "Archive closed"
-        if not isinstance(dest, zipfile.ZipInfo):
-            dest = zinfo(dest)  # see for some caveats
-        # Ensure we apply the compression
-        dest.compress_type = self.zip_compression
+        dest = self.create_zinfo(dest)
         self._zip_file.writestr(dest, contents)
 
     def close(self):
@@ -198,13 +227,8 @@ class PythonPackageArchive(object):
         self._zip_file.close()
         log.debug(
             "Created custodian serverless archive size: %0.2fmb",
-            (os.path.getsize(self._temp_archive_file.name) / (
-                1024.0 * 1024.0)))
+            (os.path.getsize(self._temp_archive_file.name) / (1024.0 * 1024.0)))
         return self
-
-    @staticmethod
-    def _temporary_opener(name, flag, mode=0o777):
-        return os.open(name, flag | os.O_TEMPORARY, mode)
 
     def remove(self):
         """Dispose of the temp file for garbage collection."""
@@ -225,11 +249,7 @@ class PythonPackageArchive(object):
     def get_stream(self):
         """Return the entire zip file as a stream. """
         assert self._closed, "Archive not closed"
-        # Windows requires TEMPORARY flag if you want to open files created by tempfile library
-        if os.name == 'nt':
-            return open(self._temp_archive_file.name, 'rb', opener=self._temporary_opener)
-        else:
-            return open(self._temp_archive_file.name, 'rb')
+        return open(self._temp_archive_file.name, 'rb')
 
     def get_reader(self):
         """Return a read-only :py:class:`~zipfile.ZipFile`."""
@@ -242,6 +262,19 @@ class PythonPackageArchive(object):
         return [n.filename for n in self.get_reader().filelist]
 
 
+def get_exec_options(options):
+    """preserve cli output options into serverless environment.
+    """
+    d = {}
+    for k in ('log_group', 'tracer', 'output_dir', 'metrics_enabled'):
+        if options[k]:
+            d[k] = options[k]
+    # ignore local fs/dir output paths
+    if 'output_dir' in d and '://' not in d['output_dir']:
+        d.pop('output_dir')
+    return d
+
+
 def checksum(fh, hasher, blocksize=65536):
     buf = fh.read(blocksize)
     while len(buf) > 0:
@@ -250,11 +283,68 @@ def checksum(fh, hasher, blocksize=65536):
     return hasher.digest()
 
 
+def generate_requirements(packages, ignore=(), exclude=(), include_self=False):
+    """Generate frozen requirements file for the given set of packages
+
+    if include_self is True we'll also include the packages in the generated
+    requirements.
+    """
+    if pkgmd is None:
+        raise ImportError("importlib_metadata missing")
+    if isinstance(packages, str):
+        packages = [packages]
+
+    deps = []
+    for p in packages:
+        _package_deps(p, deps, ignore=ignore)
+    lines = []
+    if include_self:
+        deps = list(set(deps).union(packages))
+    for d in sorted(deps):
+        if d in exclude:
+            continue
+        try:
+            lines.append(
+                '%s==%s' % (d, pkgmd.distribution(d).version))
+        except pkgmd.PackageNotFoundError:
+            continue
+    return '\n'.join(lines)
+
+
+def _package_deps(package, deps=None, ignore=()):
+    """Recursive gather package's named transitive dependencies"""
+    if deps is None:
+        deps = []
+    try:
+        pdeps = pkgmd.requires(package) or ()
+    except pkgmd.PackageNotFoundError:
+        return deps
+    for r in pdeps:
+        # skip optional deps
+        if ';' in r and 'extra' in r:
+            continue
+        for idx, c in enumerate(r):
+            if not c.isalnum() and c not in ('-', '_', '.'):
+                break
+        if idx + 1 == len(r):
+            idx += 1
+        pkg_name = r[:idx]
+        if pkg_name in ignore:
+            continue
+        if pkg_name not in deps:
+            try:
+                _package_deps(pkg_name, deps, ignore)
+            except pkgmd.PackageNotFoundError:
+                continue
+            deps.append(pkg_name)
+    return deps
+
+
 def custodian_archive(packages=None):
     """Create a lambda code archive for running custodian.
 
-    Lambda archive currently always includes `c7n` and
-    `pkg_resources`. Add additional packages in the mode block.
+    Lambda archive currently always includes `c7n`.  Add additional
+    packages via function parameters, or in policy via mode block.
 
     Example policy that includes additional packages
 
@@ -270,13 +360,13 @@ def custodian_archive(packages=None):
     packages: List of additional packages to include in the lambda archive.
 
     """
-    modules = {'c7n', 'pkg_resources'}
+    modules = {'c7n'}
     if packages:
         modules = filter(None, modules.union(packages))
-    return PythonPackageArchive(*sorted(modules))
+    return PythonPackageArchive(sorted(modules))
 
 
-class LambdaManager(object):
+class LambdaManager:
     """ Provides CRUD operations around lambda functions
     """
 
@@ -316,66 +406,12 @@ class LambdaManager(object):
 
     def remove(self, func, alias=None):
         for e in func.get_events(self.session_factory):
-            e.remove(func)
+            e.remove(func, func_deleted=True)
         log.info("Removing lambda function %s", func.name)
         try:
             self.client.delete_function(FunctionName=func.name)
         except self.client.exceptions.ResourceNotFoundException:
             pass
-
-    def metrics(self, funcs, start, end, period=5 * 60):
-
-        def func_metrics(f):
-            metrics = local_session(self.session_factory).client('cloudwatch')
-            values = {}
-            for m in ('Errors', 'Invocations', 'Durations', 'Throttles'):
-                values[m] = metrics.get_metric_statistics(
-                    Namespace="AWS/Lambda",
-                    Dimensions=[{
-                        'Name': 'FunctionName',
-                        'Value': (
-                            isinstance(f, dict) and f['FunctionName'] or f.name)}],
-                    Statistics=["Sum"],
-                    StartTime=start,
-                    EndTime=end,
-                    Period=period,
-                    MetricName=m)['Datapoints']
-            return values
-
-        with ThreadPoolExecutor(max_workers=3) as w:
-            results = list(w.map(func_metrics, funcs))
-            for m, f in zip(results, funcs):
-                if isinstance(f, dict):
-                    f['Metrics'] = m
-        return results
-
-    def logs(self, func, start, end):
-        logs = self.session_factory().client('logs')
-        group_name = "/aws/lambda/%s" % func.name
-        log.info("Fetching logs from group: %s" % group_name)
-        try:
-            logs.describe_log_groups(
-                logGroupNamePrefix=group_name)
-        except logs.exceptions.ResourceNotFoundException:
-            pass
-
-        try:
-            log_streams = logs.describe_log_streams(
-                logGroupName=group_name,
-                orderBy="LastEventTime", limit=3, descending=True)
-        except logs.exceptions.ResourceNotFoundException:
-            return
-
-        start = _timestamp_from_string(start)
-        end = _timestamp_from_string(end)
-        for s in reversed(log_streams['logStreams']):
-            result = logs.get_log_events(
-                logGroupName=group_name,
-                logStreamName=s['logStreamName'],
-                startTime=start,
-                endTime=end)
-            for e in result['events']:
-                yield e
 
     @staticmethod
     def delta_function(old_config, new_config):
@@ -383,8 +419,7 @@ class LambdaManager(object):
         for k in new_config:
             # Layers need special handling as they have extra info on describe.
             if k == 'Layers' and k in old_config and new_config[k]:
-                if sorted(new_config[k]) != sorted([
-                        l['Arn'] for l in old_config[k]]):
+                if sorted(new_config[k]) != sorted([lyr['Arn'] for lyr in old_config[k]]):
                     changed.append(k)
             # Vpc needs special handling as a dict with lists
             elif k == 'VpcConfig' and k in old_config and new_config[k]:
@@ -398,6 +433,11 @@ class LambdaManager(object):
                 if k in LAMBDA_EMPTY_VALUES and LAMBDA_EMPTY_VALUES[k] == new_config[k]:
                     continue
                 changed.append(k)
+            # For role we allow name only configuration
+            elif k == 'Role':
+                if (new_config[k] != old_config[k] and
+                        not old_config[k].split('/', 1)[1] == new_config[k]):
+                    changed.append(k)
             elif new_config[k] != old_config[k]:
                 changed.append(k)
         return changed
@@ -435,6 +475,8 @@ class LambdaManager(object):
                 params = dict(FunctionName=func.name, Publish=True)
                 params.update(code_ref)
                 result = self.client.update_function_code(**params)
+                waiter = self.client.get_waiter('function_updated')
+                waiter.wait(FunctionName=func.name)
                 changed = True
 
             # TODO/Consider also set publish above to false, and publish
@@ -444,6 +486,10 @@ class LambdaManager(object):
             new_config['Role'] = role
 
             if self._update_tags(existing, new_config.pop('Tags', {})):
+                changed = True
+
+            if self._update_architecture(func, existing,
+                    new_config.pop('Architectures', ["x86_64"]), code_ref):
                 changed = True
 
             config_changed = self.delta_function(old_config, new_config)
@@ -460,6 +506,8 @@ class LambdaManager(object):
             params.update({'Publish': True, 'Code': code_ref, 'Role': role})
             result = self.client.create_function(**params)
             self._update_concurrency(None, func)
+            waiter = self.client.get_waiter('function_active')
+            waiter.wait(FunctionName=func.name)
             changed = True
 
         return result, changed
@@ -480,6 +528,20 @@ class LambdaManager(object):
         self.client.put_function_concurrency(
             FunctionName=func.name,
             ReservedConcurrentExecutions=func.concurrency)
+
+    def _update_architecture(self, func, existing, new_architecture, code_ref):
+        existing_config = existing.get('Configuration', {})
+        existing_architecture = existing_config.get('Architectures', ["x86_64"])
+        diff = existing_architecture != new_architecture
+        changed = False
+        if diff:
+            log.debug("Updating function architecture: %s" % func.name)
+            params = dict(FunctionName=func.name, Publish=True,
+                          Architectures=new_architecture)
+            params.update(code_ref)
+            self.client.update_function_code(**params)
+            changed = True
+        return changed
 
     def _update_tags(self, existing, new_tags):
         # tag dance
@@ -572,6 +634,10 @@ class AbstractLambdaFunction:
         """Name for the lambda function"""
 
     @abc.abstractproperty
+    def event_name(self):
+        """Name for event sources"""
+
+    @abc.abstractproperty
     def runtime(self):
         """ """
 
@@ -639,7 +705,12 @@ class AbstractLambdaFunction:
     def get_archive(self):
         """Return the lambda distribution archive object."""
 
+    @abc.abstractproperty
+    def architectures(self):
+        """ """
+
     def get_config(self):
+
         conf = {
             'FunctionName': self.name,
             'MemorySize': self.memory_size,
@@ -664,6 +735,8 @@ class AbstractLambdaFunction:
             conf['VpcConfig'] = {
                 'SubnetIds': self.subnets,
                 'SecurityGroupIds': self.security_groups}
+        if self.architectures:
+            conf['Architectures'] = self.architectures
         return conf
 
 
@@ -680,10 +753,10 @@ class LambdaFunction(AbstractLambdaFunction):
 
     def __init__(self, func_data, archive):
         self.func_data = func_data
-        required = set((
+        required = {
             'name', 'handler', 'memory_size',
             'timeout', 'role', 'runtime',
-            'description'))
+            'description'}
         missing = required.difference(func_data)
         if missing:
             raise ValueError("Missing required keys %s" % " ".join(missing))
@@ -692,6 +765,8 @@ class LambdaFunction(AbstractLambdaFunction):
     @property
     def name(self):
         return self.func_data['name']
+
+    event_name = name
 
     @property
     def description(self):
@@ -776,7 +851,6 @@ def run(event, context):
 class PolicyLambda(AbstractLambdaFunction):
     """Wraps a custodian policy to turn it into a lambda function.
     """
-    handler = "custodian_policy.run"
 
     def __init__(self, policy):
         self.policy = policy
@@ -787,10 +861,16 @@ class PolicyLambda(AbstractLambdaFunction):
         prefix = self.policy.data['mode'].get('function-prefix', 'custodian-')
         return "%s%s" % (prefix, self.policy.name)
 
+    event_name = name
+
     @property
     def description(self):
         return self.policy.data.get(
             'description', 'cloud-custodian lambda policy')
+
+    @property
+    def handler(self):
+        return self.policy.data['mode'].get('handler', 'custodian_policy.run')
 
     @property
     def role(self):
@@ -798,7 +878,7 @@ class PolicyLambda(AbstractLambdaFunction):
 
     @property
     def runtime(self):
-        return self.policy.data['mode'].get('runtime', 'python3.7')
+        return self.policy.data['mode'].get('runtime', 'python3.9')
 
     @property
     def memory_size(self):
@@ -806,7 +886,7 @@ class PolicyLambda(AbstractLambdaFunction):
 
     @property
     def timeout(self):
-        return self.policy.data['mode'].get('timeout', 60)
+        return self.policy.data['mode'].get('timeout', 900)
 
     @property
     def security_groups(self):
@@ -852,11 +932,25 @@ class PolicyLambda(AbstractLambdaFunction):
     def packages(self):
         return self.policy.data['mode'].get('packages')
 
+    @property
+    def architectures(self):
+        architecture = []
+        arm64_arch = ('aarch64', 'arm64')
+        if platform.machine().lower() in arm64_arch:
+            architecture.append('arm64')
+        else:
+            architecture.append('x86_64')
+        return architecture
+
     def get_events(self, session_factory):
         events = []
-        if self.policy.data['mode']['type'] == 'config-rule':
+        if self.policy.data['mode']['type'] in (
+                'config-rule', 'config-poll-rule'):
             events.append(
                 ConfigRule(self.policy.data['mode'], session_factory))
+        elif self.policy.data['mode']['type'] == 'hub-action':
+            events.append(
+                SecurityHubAction(self.policy, session_factory))
         else:
             events.append(
                 CloudWatchEventSource(
@@ -866,7 +960,7 @@ class PolicyLambda(AbstractLambdaFunction):
     def get_archive(self):
         self.archive.add_contents(
             'config.json', json.dumps(
-                {'execution-options': dict(self.policy.options),
+                {'execution-options': get_exec_options(self.policy.options),
                  'policies': [self.policy.data]}, indent=2))
         self.archive.add_contents('custodian_policy.py', PolicyHandlerTemplate)
         self.archive.close()
@@ -893,7 +987,52 @@ def zinfo(fname):
     return info
 
 
-class CloudWatchEventSource(object):
+class AWSEventBase:
+    """for AWS Event Sources that want to utilize lazy client initialization.
+
+    Primarily utilized by sources that support static rendering to
+    IAAC templates (tools/ops/policylambda.py) to do so in an account
+    agnostic fashion.
+    """
+    client_service = None
+
+    def __init__(self, data, session_factory):
+        self.session_factory = session_factory
+        self._session = None
+        self._client = None
+        self.data = data
+
+    @property
+    def session(self):
+        if not self._session:
+            self._session = self.session_factory()
+        return self._session
+
+    @property
+    def client(self):
+        if not self._client:
+            self._client = self.session.client(self.client_service)
+        return self._client
+
+    def remove_permissions(self, func, remove_permission):
+        # typically the entire function will be deleted so we dont
+        # need to bother with removing the permission explicitly
+        if not remove_permission:
+            return True
+
+        client = self.session.client("lambda")
+        try:
+            LambdaConflictRetry(
+                client.remove_permission,
+                FunctionName=func.name,
+                StatementId=func.event_name,
+            )
+            return True
+        except client.ResourceNotFoundException:
+            pass
+
+
+class CloudWatchEventSource(AWSEventBase):
     """Subscribe a lambda to cloud watch events.
 
     Cloud watch events supports a number of different event
@@ -929,23 +1068,7 @@ class CloudWatchEventSource(object):
         'terminate-success': 'EC2 Instance Terminate Successful',
         'terminate-failure': 'EC2 Instance Terminate Unsuccessful'}
 
-    def __init__(self, data, session_factory):
-        self.session_factory = session_factory
-        self._session = None
-        self._client = None
-        self.data = data
-
-    @property
-    def session(self):
-        if not self._session:
-            self._session = self.session_factory()
-        return self._session
-
-    @property
-    def client(self):
-        if not self._client:
-            self._client = self.session.client('events')
-        return self._client
+    client_service = 'events'
 
     def get(self, rule_name):
         return resource_exists(self.client.describe_rule, Name=rule_name)
@@ -986,7 +1109,12 @@ class CloudWatchEventSource(object):
 
     def render_event_pattern(self):
         event_type = self.data.get('type')
+        pattern = self.data.get('pattern')
+
         payload = {}
+        if pattern:
+            payload.update(pattern)
+
         if event_type == 'cloudtrail':
             payload['detail-type'] = ['AWS API Call via CloudTrail']
             self.resolve_cloudtrail_payload(payload)
@@ -1013,10 +1141,23 @@ class CloudWatchEventSource(object):
             payload['detail-type'] = events
         elif event_type == 'phd':
             payload['source'] = ['aws.health']
-            payload['detail'] = {
-                'eventTypeCode': list(self.data['events'])}
+            payload.setdefault('detail', {})
+            if self.data.get('events'):
+                payload['detail'].update({
+                    'eventTypeCode': list(self.data['events'])
+                })
             if self.data.get('categories', []):
                 payload['detail']['eventTypeCategory'] = self.data['categories']
+            if not payload['detail']:
+                payload.pop('detail')
+        elif event_type == 'hub-finding':
+            payload['source'] = ['aws.securityhub']
+            payload['detail-type'] = ['Security Hub Findings - Imported']
+        elif event_type == 'hub-action':
+            payload['source'] = ['aws.securityhub']
+            payload['detail-type'] = [
+                'Security Hub Findings - Custom Action',
+                'Security Hub Insight Results']
         elif event_type == 'periodic':
             pass
         else:
@@ -1024,11 +1165,13 @@ class CloudWatchEventSource(object):
                 "Unknown lambda event source type: %s" % event_type)
         if not payload:
             return None
+        if self.data.get('pattern'):
+            payload = merge_dict(payload, self.data['pattern'])
         return json.dumps(payload)
 
     def add(self, func):
         params = dict(
-            Name=func.name, Description=func.description, State='ENABLED')
+            Name=func.event_name, Description=func.description, State='ENABLED')
 
         pattern = self.render_event_pattern()
         if pattern:
@@ -1037,10 +1180,10 @@ class CloudWatchEventSource(object):
         if schedule:
             params['ScheduleExpression'] = schedule
 
-        rule = self.get(func.name)
+        rule = self.get(func.event_name)
 
         if rule and self.delta(rule, params):
-            log.debug("Updating cwe rule for %s" % func.name)
+            log.debug("Updating cwe rule for %s" % func.event_name)
             response = self.client.put_rule(**params)
         elif not rule:
             log.debug("Creating cwe rule for %s" % (self))
@@ -1052,7 +1195,7 @@ class CloudWatchEventSource(object):
         try:
             client.add_permission(
                 FunctionName=func.name,
-                StatementId=func.name,
+                StatementId=func.event_name,
                 SourceArn=response['RuleArn'],
                 Action='lambda:InvokeFunction',
                 Principal='events.amazonaws.com')
@@ -1062,8 +1205,8 @@ class CloudWatchEventSource(object):
 
         # Add Targets
         found = False
-        response = self.client.list_targets_by_rule(Rule=func.name)
-        # CWE seems to be quite picky about function arns (no aliases/versions)
+        response = RuleRetry(self.client.list_targets_by_rule, Rule=func.event_name)
+        # CloudWatchE seems to be quite picky about function arns (no aliases/versions)
         func_arn = func.arn
 
         if func_arn.count(':') > 6:
@@ -1079,7 +1222,7 @@ class CloudWatchEventSource(object):
             self, func_arn))
 
         self.client.put_targets(
-            Rule=func.name, Targets=[{"Id": func.name, "Arn": func_arn}])
+            Rule=func.event_name, Targets=[{"Id": func.event_name, "Arn": func_arn}])
 
         return True
 
@@ -1088,33 +1231,108 @@ class CloudWatchEventSource(object):
 
     def pause(self, func):
         try:
-            self.client.disable_rule(Name=func.name)
-        except Exception:
+            self.client.disable_rule(Name=func.event_name)
+        except ClientError:
             pass
 
     def resume(self, func):
         try:
-            self.client.enable_rule(Name=func.name)
-        except Exception:
+            self.client.enable_rule(Name=func.event_name)
+        except ClientError:
             pass
 
-    def remove(self, func):
-        if self.get(func.name):
-            log.info("Removing cwe targets and rule %s", func.name)
+    def remove(self, func, func_deleted=True):
+        if self.get(func.event_name):
+            log.info("Removing cwe targets and rule %s", func.event_name)
             try:
                 targets = self.client.list_targets_by_rule(
-                    Rule=func.name)['Targets']
-                self.client.remove_targets(
-                    Rule=func.name,
-                    Ids=[t['Id'] for t in targets])
+                    Rule=func.event_name)['Targets']
+                if targets:
+                    self.client.remove_targets(
+                        Rule=func.event_name,
+                        Ids=[t['Id'] for t in targets])
             except ClientError as e:
                 log.warning(
                     "Could not remove targets for rule %s error: %s",
                     func.name, e)
-            self.client.delete_rule(Name=func.name)
+            self.client.delete_rule(Name=func.event_name)
+            self.remove_permissions(func, remove_permission=not func_deleted)
+            return True
 
 
-class BucketLambdaNotification(object):
+class SecurityHubAction:
+
+    def __init__(self, policy, session_factory):
+        self.policy = policy
+        self.session_factory = session_factory
+
+        cwe_data = self.policy.data['mode']
+        cwe_data['pattern'] = {'resources': [self._get_arn()]}
+        self.cwe = CloudWatchEventSource(
+            cwe_data, session_factory)
+
+    def __repr__(self):
+        return "<SecurityHub Action %s>" % self.policy.name
+
+    def _get_arn(self):
+        return 'arn:aws:securityhub:%s:%s:action/custom/%s' % (
+            self.policy.options.region,
+            self.policy.options.account_id,
+            self.policy.name)
+
+    def delta(self, src, tgt):
+        for k in ('Name', 'Description'):
+            if src[k] != tgt[k]:
+                return True
+        return False
+
+    def get(self, name):
+        client = local_session(self.session_factory).client('securityhub')
+        subscriber = self.cwe.get(name)
+        arn = self._get_arn()
+        actions = client.describe_action_targets(
+            ActionTargetArns=[arn]).get('ActionTargets', ())
+        assert len(actions) in (0, 1), "Found duplicate action %s" % (
+            actions,)
+        action = actions and actions.pop() or None
+        return {'event': subscriber, 'action': action}
+
+    def add(self, func):
+        self.cwe.add(func)
+        client = local_session(self.session_factory).client('securityhub')
+        action = self.get(func.event_name).get('action')
+        arn = self._get_arn()
+        params = {'Name': (
+            self.policy.data.get('title') or (
+                "%s %s" % (self.policy.resource_type.split('.')[-1].title(),
+                          self.policy.name))),
+                  'Description': (
+                      self.policy.data.get('description') or
+                      self.policy.data.get('title') or
+                      self.policy.name),
+                  'Id': self.policy.name}
+        params['Description'] = params['Description'].strip()[:500]
+        if not action:
+            log.debug('Creating SecurityHub Action %s' % arn)
+            return client.create_action_target(
+                **params).get('ActionTargetArn')
+        params.pop('Id')
+        if self.delta(action, params):
+            log.debug('Updating SecurityHub Action %s' % arn)
+            client.update_action_target(ActionTargetArn=arn, **params)
+        return arn
+
+    def update(self, func):
+        self.cwe.update(func)
+        self.add(func)
+
+    def remove(self, func, func_deleted=True):
+        self.cwe.remove(func, func_deleted)
+        client = local_session(self.session_factory).client('securityhub')
+        client.delete_action_target(ActionTargetArn=self._get_arn())
+
+
+class BucketLambdaNotification:
     """ Subscribe a lambda to bucket notifications directly. """
 
     def __init__(self, data, session_factory, bucket):
@@ -1171,7 +1389,7 @@ class BucketLambdaNotification(object):
             params['SourceAccount'] = self.data['account_s3']
             params['SourceArn'] = 'arn:aws:s3:::*'
         else:
-            params['SourceArn'] = 'arn:aws:s3:::%' % self.bucket['Name']
+            params['SourceArn'] = 'arn:aws:s3:::%s' % self.bucket['Name']
         try:
             lambda_client.add_permission(**params)
         except lambda_client.exceptions.ResourceConflictException:
@@ -1183,28 +1401,31 @@ class BucketLambdaNotification(object):
 
         return True
 
-    def remove(self, func):
+    def remove(self, func, func_deleted=True):
         s3 = self.session.client('s3')
         notifies, found = self._get_notifies(s3, func)
         if not found:
             return
 
         lambda_client = self.session.client('lambda')
-        try:
-            response = lambda_client.remove_permission(
-                FunctionName=func['FunctionName'],
-                StatementId=self.bucket['Name'])
-            log.debug("Removed lambda permission result: %s" % response)
-        except lambda_client.exceptions.ResourceNotFoundException:
-            pass
+        if not func_deleted:
+            try:
+                response = lambda_client.remove_permission(
+                    FunctionName=func.name,
+                    StatementId=self.bucket['Name'])
+                log.debug("Removed lambda permission result: %s" % response)
+            except lambda_client.exceptions.ResourceNotFoundException:
+                pass
 
         notifies['LambdaFunctionConfigurations'].remove(found)
+        notifies.pop("ResponseMetadata")
         s3.put_bucket_notification_configuration(
             Bucket=self.bucket['Name'],
             NotificationConfiguration=notifies)
+        return True
 
 
-class CloudWatchLogSubscription(object):
+class CloudWatchLogSubscription:
     """ Subscribe a lambda to a log group[s]
     """
 
@@ -1238,31 +1459,37 @@ class CloudWatchLogSubscription(object):
             # Consistent put semantics / ie no op if extant
             self.client.put_subscription_filter(
                 logGroupName=group['logGroupName'],
-                filterName=func.name,
+                filterName=func.event_name,
                 filterPattern=self.filter_pattern,
                 destinationArn=func.alias or func.arn)
 
-    def remove(self, func):
+    def remove(self, func, func_deleted=True):
         lambda_client = self.session.client('lambda')
+        found = False
         for group in self.log_groups:
-            try:
-                response = lambda_client.remove_permission(
-                    FunctionName=func.name,
-                    StatementId=group['logGroupName'][1:].replace('/', '-'))
-                log.debug("Removed lambda permission result: %s" % response)
-            except lambda_client.exceptions.ResourceNotFoundException:
-                pass
-
+            # if the function isn't deleted we need to do some cleanup
+            if not func_deleted:
+                try:
+                    response = lambda_client.remove_permission(
+                        FunctionName=func.name,
+                        StatementId=group['logGroupName'][1:].replace('/', '-'))
+                    log.debug("Removed lambda permission result: %s" % response)
+                    found = True
+                except lambda_client.exceptions.ResourceNotFoundException:
+                    pass
             try:
                 response = self.client.delete_subscription_filter(
-                    logGroupName=group['logGroupName'], filterName=func.name)
+                    logGroupName=group['logGroupName'],
+                    filterName=func.event_name)
                 log.debug("Removed subscription filter from: %s",
                           group['logGroupName'])
+                found = True
             except lambda_client.exceptions.ResourceNotFoundException:
                 pass
+        return found
 
 
-class SQSSubscription(object):
+class SQSSubscription:
     """ Subscribe a lambda to one or more SQS queues.
     """
 
@@ -1307,20 +1534,23 @@ class SQSSubscription(object):
                     BatchSize=self.batch_size)
             return modified
 
-    def remove(self, func):
+    def remove(self, func, func_deleted=True):
         client = local_session(self.session_factory).client('lambda')
         event_mappings = {
             m['EventSourceArn']: m for m in client.list_event_source_mappings(
                 FunctionName=func.name).get('EventSourceMappings', ())}
 
+        found = None
         for queue_arn in self.queue_arns:
             if queue_arn not in event_mappings:
                 continue
             client.delete_event_source_mapping(
                 UUID=event_mappings[queue_arn]['UUID'])
+            found = True
+        return found
 
 
-class SNSSubscription(object):
+class SNSSubscription:
     """ Subscribe a lambda to one or more SNS topics.
     """
 
@@ -1349,7 +1579,7 @@ class SNSSubscription(object):
             try:
                 lambda_client.add_permission(
                     FunctionName=func.name,
-                    StatementId='sns-topic-' + topic_name,
+                    StatementId=statement_id,
                     SourceArn=arn,
                     Action='lambda:InvokeFunction',
                     Principal='sns.amazonaws.com')
@@ -1364,7 +1594,7 @@ class SNSSubscription(object):
             sns_client.subscribe(
                 TopicArn=arn, Protocol='lambda', Endpoint=func.arn)
 
-    def remove(self, func):
+    def remove(self, func, func_deleted=True):
         session = local_session(self.session_factory)
         lambda_client = session.client('lambda')
         sns_client = session.client('sns')
@@ -1372,14 +1602,16 @@ class SNSSubscription(object):
         for topic_arn in self.topic_arns:
             region, topic_name, statement_id = self._parse_arn(topic_arn)
 
-            try:
-                response = lambda_client.remove_permission(
-                    FunctionName=func.name,
-                    StatementId=statement_id)
-                log.debug("Removed lambda permission result: %s" % response)
-            except ClientError as e:
-                if e.response['Error']['Code'] != 'ResourceNotFoundException':
-                    raise
+            # if the function isn't deleted we need to do some cleanup
+            if not func_deleted:
+                try:
+                    response = lambda_client.remove_permission(
+                        FunctionName=func.name,
+                        StatementId=statement_id)
+                    log.debug("Removed lambda permission result: %s" % response)
+                except ClientError as e:
+                    if e.response['Error']['Code'] != 'ResourceNotFoundException':
+                        raise
 
             paginator = sns_client.get_paginator('list_subscriptions_by_topic')
 
@@ -1395,7 +1627,7 @@ class SNSSubscription(object):
                             response = sns_client.unsubscribe(
                                 SubscriptionArn=subscription['SubscriptionArn'])
                             log.debug("Unsubscribed %s from %s" %
-                                (func.name, topic_name))
+                                      (func.name, topic_name))
                         except sns_client.exceptions.NotFoundException:
                             pass
                         raise Done  # break out of both for loops
@@ -1441,21 +1673,15 @@ class BucketSNSNotification(SNSSubscription):
                 'TopicArn': topic_arn,
                 'Events': ['s3:ObjectCreated:*']})
             s3.put_bucket_notification_configuration(Bucket=bucket['Name'],
-                NotificationConfiguration=notifies)
+                                                     NotificationConfiguration=notifies)
             topic_arns = [topic_arn]
         return topic_arns
 
 
-class ConfigRule(object):
+class ConfigRule(AWSEventBase):
     """Use a lambda as a custom config rule.
-
     """
-
-    def __init__(self, data, session_factory):
-        self.data = data
-        self.session_factory = session_factory
-        self.session = session_factory()
-        self.client = self.session.client('config')
+    client_service = 'config'
 
     def __repr__(self):
         return "<ConfigRule>"
@@ -1463,7 +1689,7 @@ class ConfigRule(object):
     def get_rule_params(self, func):
         # config does not support versions/aliases on lambda funcs
         func_arn = func.arn
-        if func_arn.count(':') > 6:
+        if isinstance(func_arn, str) and func_arn.count(':') > 6:
             func_arn, version = func_arn.rsplit(':', 1)
 
         params = dict(
@@ -1480,19 +1706,28 @@ class ConfigRule(object):
 
         if isinstance(func, PolicyLambda):
             manager = func.policy.load_resource_manager()
-            if hasattr(manager.get_model(), 'config_type'):
-                config_type = manager.get_model().config_type
+            resource_model = manager.get_model()
+            if resource_model.config_type:
+                config_type = resource_model.config_type
+            elif resource_model.cfn_type and 'schedule' in self.data:
+                config_type = resource_model.cfn_type
             else:
                 raise Exception("You may have attempted to deploy a config "
-                        "based lambda function with an unsupported config type. "
-                        "The most recent AWS config types are here: http://docs.aws"
-                        ".amazon.com/config/latest/developerguide/resource"
-                        "-config-reference.html.")
+                                "based lambda function with an unsupported config type. "
+                                "The most recent AWS config types are here: http://docs.aws"
+                                ".amazon.com/config/latest/developerguide/resource"
+                                "-config-reference.html.")
             params['Scope'] = {
                 'ComplianceResourceTypes': [config_type]}
         else:
             params['Scope']['ComplianceResourceTypes'] = self.data.get(
                 'resource-types', ())
+        if self.data.get('schedule'):
+            params['Source']['SourceDetails'] = [{
+                'EventSource': 'aws.config',
+                'MessageType': 'ScheduledNotification'
+            }]
+            params['MaximumExecutionFrequency'] = self.data['schedule']
         return params
 
     def get(self, rule_name):
@@ -1513,7 +1748,10 @@ class ConfigRule(object):
             return True
         if rule['Source'] != params['Source']:
             return True
-        if rule.get('Description', '') != rule.get('Description', ''):
+        if ('MaximumExecutionFrequency' in params and
+                rule['MaximumExecutionFrequency'] != params['MaximumExecutionFrequency']):
+            return True
+        if rule.get('Description', '') != params.get('Description', ''):
             return True
         return False
 
@@ -1524,7 +1762,7 @@ class ConfigRule(object):
         if rule and self.delta(rule, params):
             log.debug("Updating config rule for %s" % self)
             rule.update(params)
-            return self.client.put_config_rule(ConfigRule=rule)
+            return LambdaRetry(self.client.put_config_rule, ConfigRule=rule)
         elif rule:
             log.debug("Config rule up to date")
             return
@@ -1540,9 +1778,9 @@ class ConfigRule(object):
             pass
 
         log.debug("Adding config rule for %s" % func.name)
-        return self.client.put_config_rule(ConfigRule=params)
+        return LambdaRetry(self.client.put_config_rule, ConfigRule=params)
 
-    def remove(self, func):
+    def remove(self, func, func_deleted=True):
         rule = self.get(func.name)
         if not rule:
             return
@@ -1552,3 +1790,5 @@ class ConfigRule(object):
                 ConfigRuleName=func.name)
         except self.client.exceptions.NoSuchConfigRuleException:
             pass
+        self.remove_permissions(func, remove_permission=not func_deleted)
+        return True

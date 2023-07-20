@@ -1,4 +1,8 @@
-## What is c7n-org?
+# c7n-org: Multi Account Custodian Execution
+
+% [comment]: # (         !!! IMPORTANT !!!                    )
+% [comment]: # (This file is moved during document generation.)
+% [comment]: # (Only edit the original document at ./tools/c7n_org/README.md)
 
 c7n-org is a tool to run custodian against multiple AWS accounts,
 Azure subscriptions, or GCP projects in parallel.
@@ -79,7 +83,7 @@ projects:
 We also distribute scripts to generate the necessary config file in the `scripts` folder.
 
 **Note** Currently these are distributed only via git, per
-https://github.com/capitalone/cloud-custodian/issues/2420 we'll
+https://github.com/cloud-custodian/cloud-custodian/issues/2420 we'll
 be looking to incorporate them into a new c7n-org subcommand.
 
 - For **AWS**, the script `orgaccounts.py` generates a config file
@@ -88,7 +92,7 @@ be looking to incorporate them into a new c7n-org subcommand.
 - For **Azure**, the script `azuresubs.py` generates a config file
   from the Azure Resource Management API
 
-    - Please see the [Additional Azure Instructions](#Additional-Azure-Instructions) 
+    - Please see the [Additional Azure Instructions](#Additional Azure Instructions)
     - for initial setup and other important info
 
 - For **GCP**, the script `gcpprojects.py` generates a config file from
@@ -139,33 +143,40 @@ output
 
 Use `c7n-org report` to generate a csv report from the output directory.
 
-## Selecting accounts and policy for execution
+## Selecting accounts, regions, policies for execution
 
 You can filter the accounts to be run against by either passing the
 account name or id via the `-a` flag, which can be specified multiple
-times.
+times, or alternatively with comma separated values.
 
 Groups of accounts can also be selected for execution by specifying
 the `-t` tag filter.  Account tags are specified in the config
 file. ie given the above accounts config file you can specify all prod
-accounts with `-t type:prod`.
+accounts with `-t type:prod`. you can specify the -t flag multiple
+times or use a comma separated list.
 
 You can specify which policies to use for execution by either
 specifying `-p` or selecting groups of policies via their tags with
-`-l`.
+`-l`, both options support being specified multiple times or using
+comma separated values.
+
+By default in aws, c7n-org will execute in parallel across regions,
+the '-r' flag can be specified multiple times, and defaults to
+(us-east-1, us-west-2).  a special value of `all` will execute across
+all regions.
 
 
 See `c7n-org run --help` for more information.
 
-## Defining and using variables.
+## Defining and using variables
 
 Each account/subscription/project configuration in the config file can
-also define a variables section `vars` that can be used in policies
+also define a variables section `vars` that can be used in policies'
 definitions and are interpolated at execution time. These are in
 addition to the default runtime variables custodian provides like
 `account_id`, `now`, and `region`.
 
-Example of defining in c7n-org config file
+Example of defining in c7n-org config file:
 
 ```yaml
 accounts:
@@ -176,7 +187,7 @@ accounts:
     charge_code: xyz
 ```
 
-Example of using in a policy file
+Example of using in a policy file:
 
 ```yaml
 policies:
@@ -186,17 +197,29 @@ policies:
       - "tag:CostCenter": "{charge_code}"
 ```
 
-**Note** variable interpolation is senstive to proper quoting and spacing
-ie. `{ charge_code }` would be invalid due to the extra white space. Additionally
-yaml parsing can transform a value like `{charge_code}` to null, unless its quoteda
+Another enhancement for `c7n-org run-script` is to support a few vars in the script arg.
+The available vars are `account`, `account_id`, `region` and `output_dir`.
+
+```shell
+c7n-org run-script -s . -c my-projects.yml gcp_check_{region}.sh
+# or
+c7n-org run-script -s . -c my-projects.yml use_another_policy_result.sh {output_dir}
+```
+
+**Note** Variable interpolation is sensitive to proper quoting and spacing,
+i.e., `{ charge_code }` would be invalid due to the extra white space. Additionally,
+yaml parsing can transform a value like `{charge_code}` to null, unless it's quoted
 in strings like the above example. Values that do interpolation into other content
-dont require quoting ie. "my_{charge_code}"
+don't require quoting, i.e., "my_{charge_code}".
 
 ## Other commands
 
-c7n-org also supports running arbitrary scripts on AWS against
-accounts via the run-script command, which exports standard AWS SDK
-credential information into the process environment before executing.
+c7n-org also supports running arbitrary scripts against accounts via
+the run-script command.  For AWS the standard AWS SDK credential
+information is exported into the process environment before executing.
+For Azure and GCP, only the environment variables
+`AZURE_SUBSCRIPTION_ID` and `PROJECT_ID` are exported(in addition of
+the system env variables).
 
 c7n-org also supports generating reports for a given policy execution
 across accounts via the `c7n-org report` subcommand.

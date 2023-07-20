@@ -1,36 +1,58 @@
-# Copyright 2016-2019 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 import logging
-import functools
-
+import itertools
 from concurrent.futures import as_completed
+from datetime import datetime, timedelta
 
 from c7n.actions import BaseAction
-from c7n.filters import AgeFilter, OPERATORS
+from c7n.filters import AgeFilter, CrossAccountAccessFilter, Filter, ValueFilter
+from c7n.filters.offhours import OffHour, OnHour
 import c7n.filters.vpc as net_filters
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
-from c7n import tags
+from c7n.query import (
+    ConfigSource, QueryResourceManager, TypeInfo, DescribeSource, RetryPageIterator)
+from c7n.resources import rds
+from c7n.filters.kms import KmsRelatedFilter
 from .aws import shape_validate
 from c7n.exceptions import PolicyValidationError
 from c7n.utils import (
-    type_schema, local_session, snapshot_identifier, chunks,
-    get_retry, generate_arn)
+    type_schema, local_session, snapshot_identifier, chunks)
+
+from c7n.resources.rds import ParameterFilter
+from c7n.filters.backup import ConsecutiveAwsBackupsFilter
 
 log = logging.getLogger('custodian.rds-cluster')
+
+
+class DescribeCluster(DescribeSource):
+
+    def get_resources(self, ids):
+        return self.query.filter(
+            self.manager,
+            **{
+                'Filters': [
+                    {'Name': 'db-cluster-id', 'Values': ids}]})
+
+    def augment(self, resources):
+        for r in resources:
+            r['Tags'] = r.pop('TagList', ())
+        return resources
+
+
+class ConfigCluster(ConfigSource):
+
+    def load_resource(self, item):
+        resource = super().load_resource(item)
+        resource.pop('TagList', None)  # we pull tags from supplementary config
+        for k in list(resource.keys()):
+            if k.startswith('Dbc'):
+                resource["DBC%s" % (k[3:])] = resource.pop(k)
+            elif k.startswith('Iamd'):
+                resource['IAMD%s' % (k[4:])] = resource.pop(k)
+            elif k.startswith('Dbs'):
+                resource["DBS%s" % (k[3:])] = resource.pop(k)
+        return resource
 
 
 @resources.register('rds-cluster')
@@ -38,134 +60,28 @@ class RDSCluster(QueryResourceManager):
     """Resource manager for RDS clusters.
     """
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
 
         service = 'rds'
-        type = 'cluster'
+        arn = 'DBClusterArn'
+        arn_type = 'cluster'
+        arn_separator = ":"
         enum_spec = ('describe_db_clusters', 'DBClusters', None)
         name = id = 'DBClusterIdentifier'
-        filter_name = None
-        filter_type = None
+        config_id = 'DbClusterResourceId'
         dimension = 'DBClusterIdentifier'
-        date = None
+        universal_taggable = True
+        permissions_enum = ('rds:DescribeDBClusters',)
+        cfn_type = config_type = 'AWS::RDS::DBCluster'
 
-    retry = staticmethod(get_retry(('Throttled',)))
-
-    @property
-    def generate_arn(self):
-        if self._generate_arn is None:
-            self._generate_arn = functools.partial(
-                generate_arn, 'rds', region=self.config.region,
-                account_id=self.account_id,
-                resource_type=self.resource_type.type, separator=':')
-        return self._generate_arn
-
-    def augment(self, dbs):
-        return list(filter(None, _rds_cluster_tags(
-            self.get_model(),
-            dbs, self.session_factory,
-            self.generate_arn, self.retry)))
+    source_mapping = {
+        'config': ConfigCluster,
+        'describe': DescribeCluster
+    }
 
 
-RDSCluster.filter_registry.register('tag-count', tags.TagCountFilter)
-RDSCluster.filter_registry.register('marked-for-op', tags.TagActionFilter)
-
-
-def _rds_cluster_tags(model, dbs, session_factory, generator, retry):
-    """Augment rds clusters with their respective tags."""
-    client = local_session(session_factory).client('rds')
-
-    def process_tags(db):
-        try:
-            db['Tags'] = retry(
-                client.list_tags_for_resource,
-                ResourceName=generator(db[model.id]))['TagList']
-            return db
-        except client.exceptions.DBClusterNotFoundFault:
-            return None
-
-    # Rds maintains a low api call limit, so this can take some time :-(
-    return list(filter(None, map(process_tags, dbs)))
-
-
-@RDSCluster.action_registry.register('mark-for-op')
-class TagDelayedAction(tags.TagDelayedAction):
-    """Mark a RDS cluster for specific custodian action
-
-    :example:
-
-    .. code-block:: yaml
-
-            policies:
-              - name: mark-for-delete
-                resource: rds-cluster
-                filters:
-                  - type: default-vpc
-                actions:
-                  - type: mark-for-op
-                    op: delete
-                    days: 7
-    """
-
-
-@RDSCluster.action_registry.register('tag')
-@RDSCluster.action_registry.register('mark')
-class Tag(tags.Tag):
-    """Mark/tag a RDS cluster with a key/value
-
-    :example:
-
-    .. code-block:: yaml
-
-            policies:
-              - name: rds-cluster-owner-tag
-                resource: rds-cluster
-                filters:
-                  - "tag:OwnerName": absent
-                actions:
-                  - type: tag
-                    key: OwnerName
-                    value: OwnerName
-    """
-
-    concurrency = 2
-    batch_size = 5
-    permissions = ('rds:AddTagsToResource',)
-
-    def process_resource_set(self, client, dbs, ts):
-        for db in dbs:
-            arn = self.manager.generate_arn(db['DBClusterIdentifier'])
-            client.add_tags_to_resource(ResourceName=arn, Tags=ts)
-
-
-@RDSCluster.action_registry.register('remove-tag')
-@RDSCluster.action_registry.register('unmark')
-class RemoveTag(tags.RemoveTag):
-    """Removes a tag or set of tags from RDS clusters
-
-    :example:
-
-    .. code-block:: yaml
-
-            policies:
-              - name: rds-unmark-cluster
-                resource: rds-cluster
-                filters:
-                  - "tag:ExpiredTag": present
-                actions:
-                  - type: unmark
-                    tags: ["ExpiredTag"]
-    """
-
-    concurrency = 2
-    batch_size = 5
-    permissions = ('rds:RemoveTagsFromResource',)
-
-    def process_resource_set(self, client, dbs, tag_keys):
-        for db in dbs:
-            client.remove_tags_from_resource(
-                ResourceName=self.manager.generate_arn(db['DBClusterIdentifier']),
-                TagKeys=tag_keys)
+RDSCluster.filter_registry.register('offhour', OffHour)
+RDSCluster.filter_registry.register('onhour', OnHour)
 
 
 @RDSCluster.filter_registry.register('security-group')
@@ -178,12 +94,20 @@ class SecurityGroupFilter(net_filters.SecurityGroupFilter):
 class SubnetFilter(net_filters.SubnetFilter):
 
     RelatedIdsExpression = ""
+    groups = None
 
     def get_permissions(self):
         return self.manager.get_resource_manager(
             'rds-subnet-group').get_permissions()
 
+    def get_subnet_groups(self):
+        return {
+            r['DBSubnetGroupName']: r for r in
+            self.manager.get_resource_manager('rds-subnet-group').resources()}
+
     def get_related_ids(self, resources):
+        if not self.groups:
+            self.groups = self.get_subnet_groups()
         group_ids = set()
         for r in resources:
             group_ids.update(
@@ -192,13 +116,18 @@ class SubnetFilter(net_filters.SubnetFilter):
         return group_ids
 
     def process(self, resources, event=None):
-        self.groups = {
-            r['DBSubnetGroupName']: r for r in
-            self.manager.get_resource_manager('rds-subnet-group').resources()}
+        if not self.groups:
+            self.groups = self.get_subnet_groups()
         return super(SubnetFilter, self).process(resources, event)
 
 
 RDSCluster.filter_registry.register('network-location', net_filters.NetworkLocation)
+
+
+@RDSCluster.filter_registry.register('kms-key')
+class KmsFilter(KmsRelatedFilter):
+
+    RelatedIdsExpression = 'KmsKeyId'
 
 
 @RDSCluster.action_registry.register('delete')
@@ -450,22 +379,99 @@ class ModifyDbCluster(BaseAction):
                 **self.data['attributes'])
 
 
+class DescribeClusterSnapshot(DescribeSource):
+
+    def get_resources(self, resource_ids, cache=True):
+        client = local_session(self.manager.session_factory).client('rds')
+        return self.manager.retry(
+            client.describe_db_cluster_snapshots,
+            Filters=[{
+                'Name': 'db-cluster-snapshot-id',
+                'Values': resource_ids}]).get('DBClusterSnapshots', ())
+
+    def augment(self, resources):
+        for r in resources:
+            r['Tags'] = r.pop('TagList', ())
+        return resources
+
+
+class ConfigClusterSnapshot(ConfigSource):
+
+    def load_resource(self, item):
+
+        resource = super(ConfigClusterSnapshot, self).load_resource(item)
+        # db cluster snapshots are particularly mangled on keys
+        for k, v in list(resource.items()):
+            if k.startswith('Dbcl'):
+                resource.pop(k)
+                k = 'DBCl%s' % k[4:]
+                resource[k] = v
+            elif k.startswith('Iamd'):
+                resource.pop(k)
+                k = 'IAMD%s' % k[4:]
+                resource[k] = v
+        return resource
+
+
 @resources.register('rds-cluster-snapshot')
 class RDSClusterSnapshot(QueryResourceManager):
     """Resource manager for RDS cluster snapshots.
     """
 
-    class resource_type(object):
-
+    class resource_type(TypeInfo):
         service = 'rds'
-        type = 'rds-cluster-snapshot'
+        arn_type = 'cluster-snapshot'
+        arn_separator = ':'
+        arn = 'DBClusterSnapshotArn'
         enum_spec = (
             'describe_db_cluster_snapshots', 'DBClusterSnapshots', None)
         name = id = 'DBClusterSnapshotIdentifier'
-        filter_name = None
-        filter_type = None
-        dimension = None
         date = 'SnapshotCreateTime'
+        universal_taggable = object()
+        config_type = 'AWS::RDS::DBClusterSnapshot'
+        permissions_enum = ('rds:DescribeDBClusterSnapshots',)
+
+    source_mapping = {
+        'describe': DescribeClusterSnapshot,
+        'config': ConfigClusterSnapshot
+    }
+
+
+@RDSClusterSnapshot.filter_registry.register('cross-account')
+class CrossAccountSnapshot(CrossAccountAccessFilter):
+
+    permissions = ('rds:DescribeDBClusterSnapshotAttributes',)
+    attributes_key = 'c7n:attributes'
+    annotation_key = 'c7n:CrossAccountViolations'
+
+    def process(self, resources, event=None):
+        self.accounts = self.get_accounts()
+        results = []
+        with self.executor_factory(max_workers=2) as w:
+            futures = []
+            for resource_set in chunks(resources, 20):
+                futures.append(w.submit(
+                    self.process_resource_set, resource_set))
+            for f in as_completed(futures):
+                results.extend(f.result())
+        return results
+
+    def process_resource_set(self, resource_set):
+        client = local_session(self.manager.session_factory).client('rds')
+        results = []
+        for r in resource_set:
+            attrs = {t['AttributeName']: t['AttributeValues']
+             for t in self.manager.retry(
+                client.describe_db_cluster_snapshot_attributes,
+                     DBClusterSnapshotIdentifier=r['DBClusterSnapshotIdentifier'])[
+                         'DBClusterSnapshotAttributesResult']['DBClusterSnapshotAttributes']}
+            r[self.attributes_key] = attrs
+            shared_accounts = set(attrs.get('restore', []))
+            delta_accounts = shared_accounts.difference(self.accounts)
+            if delta_accounts:
+                r[self.annotation_key] = list(delta_accounts)
+                results.append(r)
+        return results
 
 
 @RDSClusterSnapshot.filter_registry.register('age')
@@ -487,9 +493,64 @@ class RDSSnapshotAge(AgeFilter):
 
     schema = type_schema(
         'age', days={'type': 'number'},
-        op={'type': 'string', 'enum': list(OPERATORS.keys())})
+        op={'$ref': '#/definitions/filters_common/comparison_operators'})
 
     date_attribute = 'SnapshotCreateTime'
+
+
+@RDSClusterSnapshot.action_registry.register('set-permissions')
+class SetPermissions(rds.SetPermissions):
+    """Set permissions for copying or restoring an RDS cluster snapshot
+
+    Use the 'add' and 'remove' parameters to control which accounts to
+    add or remove, respectively.  The default is to remove any
+    permissions granted to other AWS accounts.
+
+    Use `remove: matched` in combination with the `cross-account` filter
+    for more flexible removal options such as preserving access for
+    a set of whitelisted accounts:
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: rds-cluster-snapshot-prune-permissions
+                resource: rds-cluster-snapshot
+                filters:
+                  - type: cross-account
+                    whitelist:
+                      - '112233445566'
+                actions:
+                  - type: set-permissions
+                    remove: matched
+    """
+    permissions = ('rds:ModifyDBClusterSnapshotAttribute',)
+
+    def process_snapshot(self, client, snapshot):
+        add_accounts = self.data.get('add', [])
+        remove_accounts = self.data.get('remove', [])
+
+        if not (add_accounts or remove_accounts):
+            if CrossAccountSnapshot.attributes_key not in snapshot:
+                attrs = {
+                    t['AttributeName']: t['AttributeValues']
+                    for t in self.manager.retry(
+                        client.describe_db_cluster_snapshot_attributes,
+                        DBClusterSnapshotIdentifier=snapshot['DBClusterSnapshotIdentifier']
+                    )['DBClusterSnapshotAttributesResult']['DBClusterSnapshotAttributes']
+                }
+                snapshot[CrossAccountSnapshot.attributes_key] = attrs
+            remove_accounts = snapshot[CrossAccountSnapshot.attributes_key].get('restore', [])
+        elif remove_accounts == 'matched':
+            remove_accounts = snapshot.get(CrossAccountSnapshot.annotation_key, [])
+
+        if add_accounts or remove_accounts:
+            client.modify_db_cluster_snapshot_attribute(
+                DBClusterSnapshotIdentifier=snapshot['DBClusterSnapshotIdentifier'],
+                AttributeName='restore',
+                ValuesToRemove=remove_accounts,
+                ValuesToAdd=add_accounts)
 
 
 @RDSClusterSnapshot.action_registry.register('delete')
@@ -518,7 +579,7 @@ class RDSClusterSnapshotDelete(BaseAction):
     permissions = ('rds:DeleteDBClusterSnapshot',)
 
     def process(self, snapshots):
-        log.info("Deleting %d RDS cluster snapshots", len(snapshots))
+        self.log.info("Deleting %d RDS cluster snapshots", len(snapshots))
         client = local_session(self.manager.session_factory).client('rds')
         error = None
         with self.executor_factory(max_workers=2) as w:
@@ -544,3 +605,107 @@ class RDSClusterSnapshotDelete(BaseAction):
             except (client.exceptions.DBSnapshotNotFoundFault,
                     client.exceptions.InvalidDBSnapshotStateFault):
                 continue
+
+
+RDSCluster.filter_registry.register('consecutive-aws-backups', ConsecutiveAwsBackupsFilter)
+
+
+@RDSCluster.filter_registry.register('consecutive-snapshots')
+class ConsecutiveSnapshots(Filter):
+    """Returns RDS clusters where number of consective daily snapshots is equal to/or greater
+     than n days.
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: rdscluster-daily-snapshot-count
+                resource: rds-cluster
+                filters:
+                  - type: consecutive-snapshots
+                    days: 7
+    """
+    schema = type_schema('consecutive-snapshots', days={'type': 'number', 'minimum': 1},
+        required=['days'])
+    permissions = ('rds:DescribeDBClusterSnapshots', 'rds:DescribeDBClusters')
+    annotation = 'c7n:DBClusterSnapshots'
+
+    def process_resource_set(self, client, resources):
+        rds_clusters = [r['DBClusterIdentifier'] for r in resources]
+        paginator = client.get_paginator('describe_db_cluster_snapshots')
+        paginator.PAGE_ITERATOR_CLS = RetryPageIterator
+        cluster_snapshots = paginator.paginate(Filters=[{'Name': 'db-cluster-id',
+          'Values': rds_clusters}]).build_full_result().get('DBClusterSnapshots', [])
+
+        cluster_map = {}
+        for snapshot in cluster_snapshots:
+            cluster_map.setdefault(snapshot['DBClusterIdentifier'], []).append(snapshot)
+        for r in resources:
+            r[self.annotation] = cluster_map.get(r['DBClusterIdentifier'], [])
+
+    def process(self, resources, event=None):
+        client = local_session(self.manager.session_factory).client('rds')
+        results = []
+        retention = self.data.get('days')
+        utcnow = datetime.utcnow()
+        expected_dates = set()
+        for days in range(1, retention + 1):
+            expected_dates.add((utcnow - timedelta(days=days)).strftime('%Y-%m-%d'))
+
+        for resource_set in chunks(
+                [r for r in resources if self.annotation not in r], 50):
+            self.process_resource_set(client, resource_set)
+
+        for r in resources:
+            snapshot_dates = set()
+            for snapshot in r[self.annotation]:
+                if snapshot['Status'] == 'available':
+                    snapshot_dates.add(snapshot['SnapshotCreateTime'].strftime('%Y-%m-%d'))
+            if expected_dates.issubset(snapshot_dates):
+                results.append(r)
+        return results
+
+
+@RDSCluster.filter_registry.register('db-cluster-parameter')
+class ClusterParameterFilter(ParameterFilter):
+    """
+    Applies value type filter on set db cluster parameter values.
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: rdscluster-pg
+                resource: rds-cluster
+                filters:
+                  - type: db-cluster-parameter
+                    key: someparam
+                    op: eq
+                    value: someval
+    """
+    schema = type_schema('db-cluster-parameter', rinherit=ValueFilter.schema)
+    schema_alias = False
+    permissions = ('rds:DescribeDBInstances', 'rds:DescribeDBParameters',)
+    policy_annotation = 'c7n:MatchedDBClusterParameter'
+    param_group_attribute = 'DBClusterParameterGroup'
+
+    def _get_param_list(self, pg):
+        client = local_session(self.manager.session_factory).client('rds')
+        paginator = client.get_paginator('describe_db_cluster_parameters')
+        param_list = list(itertools.chain(*[p['Parameters']
+            for p in paginator.paginate(DBClusterParameterGroupName=pg)]))
+        return param_list
+
+    def process(self, resources, event=None):
+        results = []
+        parameter_group_list = {db.get(self.param_group_attribute) for db in resources}
+        paramcache = self.handle_paramgroup_cache(parameter_group_list)
+        for resource in resources:
+            pg_values = paramcache[resource['DBClusterParameterGroup']]
+            if self.match(pg_values):
+                resource.setdefault(self.policy_annotation, []).append(
+                    self.data.get('key'))
+                results.append(resource)
+        return results
